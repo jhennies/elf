@@ -3,6 +3,11 @@ from vigra.analysis import relabelConsecutive
 from affogato.segmentation import compute_mws_segmentation
 from affogato.segmentation import MWSGridGraph, compute_mws_clustering
 
+try:
+    from .blockwise_mws_impl import blockwise_mws_impl
+except ImportError:
+    blockwise_mc_impl = None
+
 
 def mutex_watershed(affs, offsets, strides,
                     randomize_strides=False, mask=None,
@@ -103,3 +108,10 @@ def mutex_watershed_with_seeds(affs, offsets, seeds, strides,
         return seg, grid_graph
     else:
         return seg
+
+
+# TODO additional params for the block-wise mws impl
+def blockwise_mutex_watershed(affs, offsets, strides, block_shape,
+                              randomize_strides=False, mask=None, noise_level=0):
+    if blockwise_mws_impl is None:
+        raise RuntimeError("Cannot run blockwise mutex watershed, probably because nifty is misssing.")
