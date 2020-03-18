@@ -1,4 +1,7 @@
+import ctypes
 import numbers
+import os
+from math import ceil
 from itertools import product
 
 
@@ -183,14 +186,72 @@ def chunks_overlapping_roi(roi, chunks):
     return product(*ranges)
 
 
-def downscale_shape(shape, scale_factor):
+def downscale_shape(shape, scale_factor, ceil_mode=True):
     """ Compute new shape after downscaling a volume by given scale factor.
 
     Arguments:
         shape [tuple] - input shape
         scale_factor [tuple or int] - scale factor used for down-sampling.
+        ceil_mode [bool] - whether to apply ceil to output shape (default: True)
     """
     scale_ = (scale_factor,) * len(shape) if isinstance(scale_factor, int)\
         else scale_factor
-    return tuple(sh // sf + int((sh % sf) != 0)
-                 for sh, sf in zip(shape, scale_))
+    if ceil_mode:
+        return tuple(sh // sf + int((sh % sf) != 0)
+                     for sh, sf in zip(shape, scale_))
+    else:
+        return tuple(sh // sf for sh, sf in zip(shape, scale_))
+
+
+def set_numpy_threads(n_threads):
+    """ Set the number of threads numpy exposes to its
+    underlying linalg library.
+
+    This needs to be called BEFORE the numpy import and sets the number
+    of threads statically.
+    Based on answers in https://github.com/numpy/numpy/issues/11826.
+    """
+
+    # set number of threads for mkl if it is used
+    try:
+        import mkl
+        mkl.set_num_threaads(n_threads)
+    except Exception:
+        pass
+
+    for name in ['libmkl_rt.so', 'libmkl_rt.dylib', 'mkl_Rt.dll']:
+        try:
+            mkl_rt = ctypes.CDLL(name)
+            mkl_rt.mkl_set_num_threads(ctypes.byref(ctypes.c_int(n_threads)))
+        except Exception:
+            pass
+
+    # set number of threads in all possibly relevant environment variables
+    os.environ['OMP_NUM_THREADS'] = str(n_threads)
+    os.environ['OPENBLAS_NUM_THREADS'] = str(n_threads)
+    os.environ['MKL_NUM_THREADS'] = str(n_threads)
+    os.environ['VECLIB_NUM_THREADS'] = str(n_threads)
+    os.environ['NUMEXPR_NUM_THREADS'] = str(n_threads)
+
+
+def sigma_to_halo(sigma, order):
+    """ Compute the halo value to apply filter in parallel.
+
+    Based on:
+    https://github.com/ukoethe/vigra/blob/master/include/vigra/multi_blockwise.hxx#L408
+
+    Arguments:
+        sigma [float or list[float]] - sigma value
+        order [int] - order of the filter
+    """
+    # NOTE it seems like the halo given here is not sufficient and the test in ilastik
+    # for the reference implementation do not catch this because of insufficient block-shape:
+    # https://github.com/ilastik/ilastik/blob/master/tests/test_workflows/carving/testCarvingTools.py
+    # one way to deal with this is to introduce another multiplier to increase the halo,
+    # but this should be investigated further!
+    multiplier = 2
+    if isinstance(sigma, numbers.Number):
+        halo = multiplier * int(ceil(3.0 * sigma + 0.5 * order + 0.5))
+    else:
+        halo = [multiplier * int(ceil(3.0 * sig + 0.5 * order + 0.5)) for sig in sigma]
+    return halo

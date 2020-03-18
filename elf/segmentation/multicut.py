@@ -10,14 +10,49 @@ from vigra.analysis import relabelConsecutive
 from .blockwise_mc_impl import blockwise_mc_impl
 
 
+def _to_objective(graph, costs):
+    if isinstance(graph, nifty.graph.UndirectedGraph):
+        graph_ = graph
+    else:
+        graph_ = nifty.graph.undirectedGraph(graph.numberOfNodes)
+        graph_.insertEdges(graph.uvIds())
+    objective = nmc.multicutObjective(graph_, costs)
+    return objective
+
+
+def _weight_edges(costs, edge_sizes, weighting_exponent):
+    w = edge_sizes / float(edge_sizes.max())
+    if weighting_exponent != 1.:
+        w = w**weighting_exponent
+    costs *= w
+    return costs
+
+
+def _weight_populations(costs, edge_sizes, edge_populations, weighting_exponent):
+    # check that the population indices cover each edge at most once
+    covered = np.zeros(len(costs), dtype='uint8')
+    for edge_pop in edge_populations:
+        covered[edge_pop] += 1
+    assert (covered <= 1).all()
+
+    for edge_pop in edge_populations:
+        costs[edge_pop] = _weight_edges(costs[edge_pop], edge_sizes[edge_pop],
+                                        weighting_exponent)
+
+    return costs
+
+
 def transform_probabilities_to_costs(probs, beta=.5, edge_sizes=None,
-                                     weighting_exponent=1.):
+                                     edge_populations=None, weighting_exponent=1.):
     """ Transform probabilities to costs via negative log likelihood.
 
     Arguments:
         probs [np.ndarray] - Input probabilities.
         beta [float] - boundary bias (default: .5)
         edge_sizes [np.ndarray] - sizes of edges for weighting (default: None)
+        edge_populations [list[np.ndarray]] - different edge populations that will be
+            size weighted independently passed as list of masks or index arrays.
+            This can e.g. be useful if we have flat superpixels in a 3d problem. (default: None)
         weighting_exponent [float] - exponent used for weighting (default: 1.)
     """
     p_min = 0.001
@@ -28,11 +63,63 @@ def transform_probabilities_to_costs(probs, beta=.5, edge_sizes=None,
     # weight the costs with edge sizes, if they are given
     if edge_sizes is not None:
         assert len(edge_sizes) == len(costs)
-        w = edge_sizes / edge_sizes.max()
-        if weighting_exponent != 1.:
-            w = w**weighting_exponent
-        costs *= w
+        if edge_populations is None:
+            costs = _weight_edges(costs, edge_sizes, weighting_exponent)
+        else:
+            costs = _weight_populations(costs, edge_sizes, edge_populations, weighting_exponent)
     return costs
+
+
+def compute_edge_costs(probs, edge_sizes=None, z_edge_mask=None,
+                       beta=.5, weighting_scheme=None, weighting_exponent=1.):
+    """ Compute edge costs from probabilities with a pre-defined weighting scheme.
+
+    Arguments:
+        probs [np.ndarray] - Input probabilities.
+        edge_sizes [np.ndarray] - sizes of edges for weighting (default: None)
+        z_edge_mask [np.ndarray] - edge mask for inter-slice edges,
+            only necessary for weighting schemes z or xyz (default: None)
+        beta [float] - boundary bias (default: .5)
+        weighting_scheme [str] - scheme for weighting the edge costs based on size
+            of the edges (default: NOne)
+        weighting_exponent [float] - exponent used for weighting (default: 1.)
+    """
+    schemes = (None, 'all', 'none', 'xyz', 'z')
+    if weighting_scheme not in schemes:
+        schemes_str = ', '.join([str(scheme) for scheme in schemes])
+        raise ValueError("Weighting scheme must be one of %s, got %s" % (schemes_str, str(weighting_scheme)))
+
+    if weighting_scheme is None or weighting_scheme == 'none':
+        edge_pop = edge_sizes_ = None
+
+    elif weighting_scheme == 'all':
+        if edge_sizes is None:
+            raise ValueError("Need edge sizes for weighting scheme all")
+        if len(edge_sizes) != len(probs):
+            raise ValueError("Invalid edge sizes")
+        edge_sizes_ = edge_sizes
+        edge_pop = None
+
+    elif weighting_scheme == 'xyz':
+        if edge_sizes is None or z_edge_mask is None:
+            raise ValueError("Need edge sizes and z edge mask for weighting scheme xyz")
+        if len(edge_sizes) != len(probs) or len(z_edge_mask) != len(probs):
+            raise ValueError("Invalid edge sizes or z edge mask")
+        edge_pop = [z_edge_mask, np.logical_not(z_edge_mask)]
+        edge_sizes_ = edge_sizes
+
+    elif weighting_scheme == 'z':
+        edge_pop = [z_edge_mask, np.logical_not(z_edge_mask)]
+        edge_sizes_ = edge_sizes.copy()
+        edge_sizes_[edge_pop[1]] = 1.
+        if len(edge_sizes) != len(probs) or len(z_edge_mask) != len(probs):
+            raise ValueError("Invalid edge sizes or z edge mask")
+        if edge_sizes is None or z_edge_mask is None:
+            raise ValueError("Need edge sizes and z edge mask for weighting scheme z")
+
+    return transform_probabilities_to_costs(probs, beta=beta, edge_sizes=edge_sizes_,
+                                            edge_populations=edge_pop, weighting_exponent=weighting_exponent)
+
 
 #
 # TODO
@@ -93,10 +180,10 @@ def multicut_kernighan_lin(graph, costs, time_limit=None, warmstart=True, **kwar
     Arguments:
         graph [nifty.graph] - graph of multicut problem
         costs [np.ndarray] - edge costs of multicut problem
-        time_limit [float] - time limit for inference (default: None)
+        time_limit [float] - time limit for inference in seconds (default: None)
         warmstart [bool] - whether to warmstart with gaec solution (default: True)
     """
-    objective = nmc.multicutObjective(graph, costs)
+    objective = _to_objective(graph, costs)
     solver = objective.kernighanLinFactory(warmStartGreedy=warmstart).create(objective)
     if time_limit is None:
         return solver.optimize()
@@ -115,9 +202,9 @@ def multicut_gaec(graph, costs, time_limit=None, **kwargs):
     Arguments:
         graph [nifty.graph] - graph of multicut problem
         costs [np.ndarray] - edge costs of multicut problem
-        time_limit [float] - time limit for inference (default: None)
+        time_limit [float] - time limit for inference in seconds (default: None)
     """
-    objective = nmc.multicutObjective(graph, costs)
+    objective = _to_objective(graph, costs)
     solver = objective.greedyAdditiveFactory().create(objective)
     if time_limit is None:
         return solver.optimize()
@@ -136,7 +223,7 @@ def multicut_decomposition(graph, costs, time_limit=None,
     Arguments:
         graph [nifty.graph] - graph of multicut problem
         costs [np.ndarray] - edge costs of multicut problem
-        time_limit [float] - time limit for inference (default: None)
+        time_limit [float] - time limit for inference in seconds (default: None)
         n_threads [int] - number of threads (default: 1)
         internal_solver [str] - name of solver used for connected components
             (default: 'kernighan-lin')
@@ -225,7 +312,7 @@ def multicut_decomposition(graph, costs, time_limit=None,
 # TODO enable warmstart with gaec / kl
 def multicut_fusion_moves(graph, costs, time_limit=None, n_threads=1,
                           internal_solver='kernighan-lin', seed_fraction=.05,
-                          num_it=1000, num_it_stop=10):
+                          num_it=1000, num_it_stop=25):
     """ Solve multicut problem with fusion moves solver.
 
     Introduced in "Fusion moves for correlation clustering":
@@ -234,7 +321,7 @@ def multicut_fusion_moves(graph, costs, time_limit=None, n_threads=1,
     Arguments:
         graph [nifty.graph] - graph of multicut problem
         costs [np.ndarray] - edge costs of multicut problem
-        time_limit [float] - time limit for inference (default: None)
+        time_limit [float] - time limit for inference in seconds (default: None)
         n_threasd [int] - number of threads (default: 1)
         internal_solver [str] - name of solver used for connected components
             (default: 'kernighan-lin')
@@ -244,7 +331,7 @@ def multicut_fusion_moves(graph, costs, time_limit=None, n_threads=1,
         num_it_stop [int] - stop if no improvement after num_it_stop (default: 1000)
     """
     assert internal_solver in ('kernighan-lin', 'greedy-additive')
-    objective = nmc.multicutObjective(graph, costs)
+    objective = _to_objective(graph, costs)
 
     if internal_solver == 'kernighan-lin':
         sub_solver = objective.greedyAdditiveFactory()
@@ -252,16 +339,13 @@ def multicut_fusion_moves(graph, costs, time_limit=None, n_threads=1,
         sub_solver = objective.kernighanLinFactory(warmStartGreedy=True)
 
     sub_solver = objective.fusionMoveSettings(mcFactory=sub_solver)
-    proposal_gen = objective.watershedProposals(sigma=10,
-                                                seedFraction=seed_fraction)
+    proposal_gen = objective.watershedCcProposals(sigma=2., numberOfSeeds=seed_fraction)
 
-    solver = objective.fusionMoveBasedFactory(fusionMove=sub_solver,
-                                              verbose=1, fuseN=2,
-                                              proposalGen=proposal_gen,
-                                              numberOfIterations=num_it,
-                                              numberOfParallelProposals=2*n_threads,
-                                              numberOfThreads=n_threads,
-                                              stopIfNoImprovement=num_it_stop).create(objective)
+    solver = objective.ccFusionMoveBasedFactory(fusionMove=sub_solver,
+                                                proposalGenerator=proposal_gen,
+                                                numberOfThreads=n_threads,
+                                                numberOfIterations=num_it,
+                                                stopIfNoImprovement=num_it_stop).create(objective)
 
     if time_limit is None:
         return solver.optimize()

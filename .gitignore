@@ -125,9 +125,11 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
+# tmp folders and data
 tmp/
 
 # Pycharm
 *.pyc
 .idea/
 
+*.h5
