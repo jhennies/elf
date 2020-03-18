@@ -5,6 +5,7 @@ import vigra
 import nifty.graph.rag as nrag
 import nifty.distributed as ndist
 import nifty.ground_truth as ngt
+from sklearn.ensemble import RandomForestClassifier
 
 from .multicut import transform_probabilities_to_costs
 
@@ -247,3 +248,23 @@ def lifted_problem_from_segmentation(rag, watershed, input_segmentation,
     lifted_costs[~same_mask] = different_segment_cost
 
     return lifted_uvs, lifted_costs
+
+
+# TODO implement random forest learned probabilities
+def learned_probabilities(
+        x_train,
+        y_train,
+        x_test,
+        n_trees=200
+):
+
+    rf = RandomForestClassifier(
+        n_estimators=n_trees,
+        n_jobs=-1,
+        verbose=1
+    )
+
+    rf.fit(x_train, y_train)
+    y_test = rf.predict(x_test)
+
+    return y_test
